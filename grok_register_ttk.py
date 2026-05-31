@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     "duckmail_api_key": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
-    "cloudflare_auth_mode": "bearer",
+    "cloudflare_auth_mode": "x-admin-auth",
     "cloudflare_path_domains": "/domains",
     "cloudflare_path_accounts": "/accounts",
     "cloudflare_path_token": "/token",
@@ -141,7 +141,7 @@ def get_cloudflare_api_key():
 
 
 def get_cloudflare_auth_mode():
-    return str(config.get("cloudflare_auth_mode", "bearer") or "bearer").lower()
+    return str(config.get("cloudflare_auth_mode", "x-admin-auth") or "x-admin-auth").lower()
 
 
 def get_cloudflare_path(key, default_path):
@@ -155,21 +155,13 @@ def cloudflare_build_headers(content_type=False):
     headers = {"Content-Type": "application/json"} if content_type else {}
     key = get_cloudflare_api_key()
     mode = get_cloudflare_auth_mode()
-    if key:
-        if mode == "x-api-key":
-            headers["X-API-Key"] = key
-        elif mode != "none":
-            headers["Authorization"] = f"Bearer {key}"
+    if key and mode == "x-admin-auth":
+        headers["x-admin-auth"] = key
     return headers
 
 
 def cloudflare_apply_auth_params(params=None):
-    merged = dict(params or {})
-    key = get_cloudflare_api_key()
-    mode = get_cloudflare_auth_mode()
-    if key and mode == "query-key":
-        merged["key"] = key
-    return merged
+    return dict(params or {})
 
 
 def _pick_list_payload(data):
@@ -192,28 +184,40 @@ def _pick_list_payload(data):
 
 
 def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email v1.8.x: POST /api/new_address -> {address,jwt}"""
+    """适配 cloudflare_temp_email: POST /admin/new_address -> {address, jwt}"""
     global _cf_domain_index
-    url = f"{api_base}/api/new_address"
-    payload = {}
+    path = get_cloudflare_path("cloudflare_path_accounts", "/admin/new_address")
+    url = f"{api_base}{path}"
+    headers = cloudflare_build_headers(content_type=True)
+    # 生成随机用户名
+    name = generate_username(length=10)
+    # 获取域名
+    domain = None
     try:
-        # 在多个域名之间轮换，降低单域偶发不收件导致的失败率
         domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
         if domains:
-            payload["domain"] = domains[_cf_domain_index % len(domains)]
+            domain = domains[_cf_domain_index % len(domains)]
             _cf_domain_index += 1
     except Exception:
         pass
-    resp = http_post(url, json=payload, headers={"Content-Type": "application/json"})
+    if not domain:
+        raise Exception("未配置域名，请在 config.json 中设置 defaultDomains")
+    payload = {
+        "name": name,
+        "domain": domain,
+        "enablePrefix": True,
+        "enableRandomSubdomain": False
+    }
+    resp = http_post(url, json=payload, headers=headers)
     resp.raise_for_status()
     try:
         data = resp.json()
     except Exception:
-        raise Exception(f"Cloudflare /api/new_address 返回非JSON: {resp.text[:300]}")
+        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
     address = data.get("address")
     jwt = data.get("jwt")
     if not address or not jwt:
-        raise Exception(f"Cloudflare /api/new_address 缺少 address/jwt: {data}")
+        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
     return address, jwt
 
 
@@ -766,7 +770,7 @@ def pick_domain(api_key=None):
 
 
 def get_email_provider():
-    return config.get("email_provider", "duckmail")
+    return config.get("email_provider", "cloudflare")
 
 
 def get_email_and_token(api_key=None):
@@ -1895,7 +1899,7 @@ class GrokRegisterGUI:
         config_frame = ttk.LabelFrame(main_frame, text="配置", padding=10)
         config_frame.pack(fill=tk.X, pady=5)
         ttk.Label(config_frame, text="邮箱服务商:").grid(row=0, column=0, sticky=tk.W)
-        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
+        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "cloudflare"))
         self.email_provider_combo = ttk.Combobox(config_frame, textvariable=self.email_provider_var, values=["duckmail", "yyds", "cloudflare"], width=12, state="readonly")
         self.email_provider_combo.grid(row=0, column=1, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="注册数量:").grid(row=0, column=2, sticky=tk.W, padx=10)
@@ -1923,11 +1927,11 @@ class GrokRegisterGUI:
         self.cloudflare_api_key_entry = ttk.Entry(config_frame, textvariable=self.cloudflare_api_key_var, width=30)
         self.cloudflare_api_key_entry.grid(row=5, column=1, columnspan=3, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="Cloudflare 鉴权模式:").grid(row=6, column=0, sticky=tk.W)
-        self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "bearer"))
+        self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "x-admin-auth"))
         self.cloudflare_auth_mode_combo = ttk.Combobox(
             config_frame,
             textvariable=self.cloudflare_auth_mode_var,
-            values=["query-key", "bearer", "x-api-key", "none"],
+            values=["x-admin-auth", "none"],
             width=12,
             state="readonly",
         )
@@ -1946,17 +1950,22 @@ class GrokRegisterGUI:
         self.cloudflare_paths_entry = ttk.Entry(config_frame, textvariable=self.cloudflare_paths_var, width=30)
         self.cloudflare_paths_entry.grid(row=7, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="grok2api 本地自动入池:").grid(row=8, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="默认域名:").grid(row=8, column=0, sticky=tk.W)
+        self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
+        self.default_domains_entry = ttk.Entry(config_frame, textvariable=self.default_domains_var, width=30)
+        self.default_domains_entry.grid(row=8, column=1, columnspan=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="grok2api 本地自动入池:").grid(row=9, column=0, sticky=tk.W)
         self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", True)))
         self.grok2api_local_auto_check = ttk.Checkbutton(config_frame, variable=self.grok2api_local_auto_var)
-        self.grok2api_local_auto_check.grid(row=8, column=1, sticky=tk.W, padx=5)
+        self.grok2api_local_auto_check.grid(row=9, column=1, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="grok2api 本地 token.json:").grid(row=9, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="grok2api 本地 token.json:").grid(row=10, column=0, sticky=tk.W)
         self.grok2api_local_file_var = tk.StringVar(value=str(config.get("grok2api_local_token_file", "")))
         self.grok2api_local_file_entry = ttk.Entry(config_frame, textvariable=self.grok2api_local_file_var, width=30)
-        self.grok2api_local_file_entry.grid(row=9, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.grok2api_local_file_entry.grid(row=10, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="grok2api 池名:").grid(row=10, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="grok2api 池名:").grid(row=11, column=0, sticky=tk.W)
         self.grok2api_pool_name_var = tk.StringVar(value=str(config.get("grok2api_pool_name", "ssoBasic")))
         self.grok2api_pool_name_combo = ttk.Combobox(
             config_frame,
@@ -1965,26 +1974,22 @@ class GrokRegisterGUI:
             width=12,
             state="readonly",
         )
-        self.grok2api_pool_name_combo.grid(row=10, column=1, sticky=tk.W, padx=5)
+        self.grok2api_pool_name_combo.grid(row=11, column=1, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="grok2api 远端自动入池:").grid(row=11, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="grok2api 远端自动入池:").grid(row=12, column=0, sticky=tk.W)
         self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
         self.grok2api_remote_auto_check = ttk.Checkbutton(config_frame, variable=self.grok2api_remote_auto_var)
-        self.grok2api_remote_auto_check.grid(row=11, column=1, sticky=tk.W, padx=5)
+        self.grok2api_remote_auto_check.grid(row=12, column=1, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="grok2api 远端 Base:").grid(row=12, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="grok2api 远端 Base:").grid(row=13, column=0, sticky=tk.W)
         self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
         self.grok2api_remote_base_entry = ttk.Entry(config_frame, textvariable=self.grok2api_remote_base_var, width=30)
-        self.grok2api_remote_base_entry.grid(row=12, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.grok2api_remote_base_entry.grid(row=13, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="grok2api 远端 app_key:").grid(row=13, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="grok2api 远端 app_key:").grid(row=14, column=0, sticky=tk.W)
         self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
         self.grok2api_remote_key_entry = ttk.Entry(config_frame, textvariable=self.grok2api_remote_key_var, width=30)
-        self.grok2api_remote_key_entry.grid(row=13, column=1, columnspan=3, sticky=tk.W, padx=5)
-        ttk.Label(config_frame, text="默认域名(defaultDomains):").grid(row=14, column=0, sticky=tk.W)
-        self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
-        self.default_domains_entry = ttk.Entry(config_frame, textvariable=self.default_domains_var, width=30)
-        self.default_domains_entry.grid(row=14, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.grok2api_remote_key_entry.grid(row=14, column=1, columnspan=3, sticky=tk.W, padx=5)
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
         self.start_btn = ttk.Button(btn_frame, text="开始注册", command=self.start_registration)
@@ -2160,12 +2165,12 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
 
-        config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
+        config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
-        config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "bearer"
+        config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "x-admin-auth"
         config["grok2api_auto_add_local"] = bool(self.grok2api_local_auto_var.get())
         config["grok2api_local_token_file"] = self.grok2api_local_file_var.get().strip()
         config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"

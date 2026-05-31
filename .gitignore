@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Virtual environment
+.venv/
+
 accounts_*.txt
 mail_credentials.txt
 
